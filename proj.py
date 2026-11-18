@@ -45,18 +45,20 @@ DEFAULT_BANK_B = np.array([0.45, 0.12, 0.09])
 # Table height in the base frame. MEASURE.
 TABLE_Z = 0.0
 
-# Supply positions: blocks lie flat on the table, (x, y, yaw of the long side).
-# TO DECIDE: must be reachable and out of the way of the bridge.
-SUPPLY = [
-    (0.33, 0.36, math.pi / 2),
-    (0.42, 0.36, math.pi / 2),
-    (0.51, 0.36, math.pi / 2),
-    (0.60, 0.36, math.pi / 2),
-    (0.33, -0.36, math.pi / 2),
-    (0.42, -0.36, math.pi / 2),
-    (0.51, -0.36, math.pi / 2),
-    (0.60, -0.36, math.pi / 2),
+# Supply stacks: blocks lie flat, stacked straight up on the table, all with the
+# same yaw. (x, y, yaw of the long side, number of blocks in the stack).
+# Blocks are taken from the top of the first stack until it is empty, then from
+# the next stack. TO DECIDE: must be reachable and out of the way of the bridge.
+SUPPLY_STACKS = [
+    (0.42, 0.36, math.pi / 2, 4),
+    (0.42, -0.36, math.pi / 2, 4),
 ]
+
+# How far below a block's top face the TCP (fingertip centre) goes to grasp it.
+# Half a block grips it at mid-height. The finger pads reach below the TCP, so
+# with a block underneath, keep this small enough that the pads stay above it.
+# MEASURE with the real fingers.
+GRASP_DEPTH = 0.015
 
 MIN_BANK_BEARING = 0.02  # minimum length of deck resting on each bank
 DECK_GAP = 0.004         # gap between adjacent deck ends, so placing the second one does not hit the first
@@ -175,8 +177,11 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
         c[2] = deck_z
         placements.append(Placement(f"deck{i + 1}", c, wrap_yaw(axis_yaw)))
 
-    if len(placements) > len(SUPPLY):
-        warnings.append(f"{len(placements)} blocks are needed but only {len(SUPPLY)} supply positions are defined")
+    n_supply = sum(stack[3] for stack in SUPPLY_STACKS)
+    if len(placements) > n_supply:
+        warnings.append(f"{len(placements)} blocks are needed but the supply stacks hold only {n_supply}")
+    if GRASP_DEPTH > BLOCK_H:
+        warnings.append("GRASP_DEPTH is more than a block high: the fingers would reach the block below")
 
     return placements, report, warnings, max(bank_z, pier_top)
 
@@ -282,14 +287,45 @@ class Step:
         return 1.0  # rough estimate for a gripper action; MEASURE
 
 
+def supply_picks():
+    """Where each supply block is, in the order they are picked.
+
+    Returns a list of (x, y, yaw, top_z): top_z is the height of that block's
+    top face. Each stack is emptied from the top down before the next one, so
+    every pick is a little lower than the one before it on the same stack.
+    """
+
+    picks = []
+    for sx, sy, syaw, count in SUPPLY_STACKS:
+        for remaining in range(count, 0, -1):
+            picks.append((sx, sy, syaw, TABLE_Z + remaining * BLOCK_H))
+    return picks
+
+
+def supply_top():
+    """Height of the tallest supply stack, before any block is taken."""
+
+    return TABLE_Z + max((stack[3] for stack in SUPPLY_STACKS), default=0) * BLOCK_H
+
+
+def safe_height(structure_top):
+    """TCP height for transfers: the carried block's bottom clears both the
+    bridge and the supply stacks by TRANSFER_MARGIN."""
+
+    tallest = max(structure_top, supply_top())
+    # The TCP sits GRASP_DEPTH below the carried block's top, so the block's
+    # bottom is BLOCK_H - GRASP_DEPTH below the TCP.
+    return tallest + (BLOCK_H - GRASP_DEPTH) + TRANSFER_MARGIN
+
+
 def plan_build(panda, placements, structure_top, q_start):
     gen = RuckigMotionGenerator()
-    safe_z = structure_top + BLOCK_H + TRANSFER_MARGIN  # the TCP is at the block's mid-height
+    safe_z = safe_height(structure_top)
     steps: list[Step] = [Step("open gripper", "open", width=OPEN_WIDTH)]
     q = np.asarray(q_start, dtype=float)
 
-    for placement, (sx, sy, syaw) in zip(placements, SUPPLY):
-        pick_z = TABLE_Z + BLOCK_H / 2
+    for placement, (sx, sy, syaw, top_z) in zip(placements, supply_picks()):
+        pick_z = top_z - GRASP_DEPTH
         pick_yaw = wrap_yaw(syaw)
         name = placement.name
 
@@ -314,7 +350,10 @@ def plan_build(panda, placements, structure_top, q_start):
         steps.append(Step(f"{name}: transfer above place pose", "move", traj, dt))
         q = traj[-1]
 
-        traj, dt = vertical_trajectory(panda, gen, q, placement.center[2] + PLACE_DROP)
+        # The TCP holds the block GRASP_DEPTH below its top face, so for the
+        # block's centre to land on placement.center the TCP stops this high.
+        place_z = placement.center[2] + BLOCK_H / 2 - GRASP_DEPTH
+        traj, dt = vertical_trajectory(panda, gen, q, place_z + PLACE_DROP)
         steps.append(Step(f"{name}: descend to place", "move", traj, dt))
         q = traj[-1]
         steps.append(Step(f"{name}: release", "open", width=OPEN_WIDTH))
@@ -408,7 +447,7 @@ def main() -> None:
     print("\n== Motion plan ==")
     steps = plan_build(panda, placements, top, q_start)
     total = sum(st.duration for st in steps)
-    n_blocks = min(len(placements), len(SUPPLY))
+    n_blocks = min(len(placements), len(supply_picks()))
     print(f"  {n_blocks} blocks, {len(steps)} steps, about {total:.0f} s (limit {TIME_LIMIT:.0f} s)")
     for problem in check_steps(steps):
         print("  [problem]", problem)
