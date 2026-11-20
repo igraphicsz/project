@@ -34,39 +34,60 @@ from csc376_franky.motion_generator import RuckigMotionGenerator
 # ---------------------------------------------------------------------------
 
 # Block size [length, width, height] in metres. MEASURE.
-BLOCK_L, BLOCK_W, BLOCK_H = 0.15, 0.05, 0.03
+BLOCK_L, BLOCK_W, BLOCK_H = 0.05, 0.025, 0.015
+
+# Which pair of faces the fingers close on:
+# "width":  the two long faces, holding the block across BLOCK_W. A finger then
+#           goes into the gap between the two blocks of a layer, so that gap
+#           must be at least FINGER_CLEARANCE (needs BLOCK_L >= 2·BLOCK_W + 2 cm).
+# "length": the two short end faces, holding the block across BLOCK_L. The two
+#           blocks of a layer can then sit almost touching (LAYER_GAP apart).
+#           Needs BLOCK_L + 2 cm <= 8 cm, what the Franka Hand opens to.
+GRIP_ACROSS = "length"
 
 # Inner-edge midpoints of the two banks, Panda base frame [x, y, z],
 # z = bank top height. MEASURE.
 # How: jog the fingertips to the bank edge and read robot.get_current_pose().t.
-DEFAULT_BANK_A = np.array([0.45, -0.12, 0.09])
-DEFAULT_BANK_B = np.array([0.45, 0.12, 0.09])
+# The bridge runs along y. The pier gets round(bank height / BLOCK_H) layers of
+# 2 blocks: z = 0.03 with 1.5 cm blocks gives 2 layers, 4 blocks.
+# Without a deck the single pier sits midway between the banks, so the span must
+# leave FINGER_CLEARANCE between the pier and each bank: the pier is 5.4 cm wide
+# (two 2.5 cm blocks + LAYER_GAP), so the span must be at least 5.4 + 2·2 = 9.4 cm.
+DEFAULT_BANK_A = np.array([0.45, -0.047, 0.03])
+DEFAULT_BANK_B = np.array([0.45, 0.047, 0.03])
+
+# False: build only the piers, no deck blocks on top.
+BUILD_DECK = False
 
 # Table height in the base frame. MEASURE.
 TABLE_Z = 0.0
 
-# Supply positions: blocks lie flat on the table, (x, y, yaw of the long side).
-# TO DECIDE: must be reachable and out of the way of the bridge.
-SUPPLY = [
-    (0.33, 0.36, math.pi / 2),
-    (0.42, 0.36, math.pi / 2),
-    (0.51, 0.36, math.pi / 2),
-    (0.60, 0.36, math.pi / 2),
-    (0.33, -0.36, math.pi / 2),
-    (0.42, -0.36, math.pi / 2),
-    (0.51, -0.36, math.pi / 2),
-    (0.60, -0.36, math.pi / 2),
+# Supply stacks: blocks lie flat, stacked straight up on the table, all with the
+# same yaw. (x, y, yaw of the long side, number of blocks in the stack).
+# Blocks are taken from the top of the first stack until it is empty, then from
+# the next stack. TO DECIDE: must be reachable and out of the way of the bridge.
+SUPPLY_STACKS = [
+    (0.42, 0.36, math.pi / 2, 4),
 ]
+
+# How far below a block's top face the TCP (fingertip centre) goes to grasp it.
+# Half a block grips it at mid-height. The finger pads reach below the TCP, so
+# with a block underneath, keep this small enough that the pads stay above it.
+# MEASURE with the real fingers: with thin blocks the pads may reach the block below.
+GRASP_DEPTH = BLOCK_H / 2
 
 MIN_BANK_BEARING = 0.02  # minimum length of deck resting on each bank
 DECK_GAP = 0.004         # gap between adjacent deck ends, so placing the second one does not hit the first
-FINGER_CLEARANCE = 0.02  # minimum gap between the two blocks of a layer (the fingers go in there)
+FINGER_CLEARANCE = 0.02  # minimum gap wherever a finger has to go between two things
+LAYER_GAP = 0.004        # minimum gap between the two blocks of a layer when no finger goes in it
 HEIGHT_TOLERANCE = 0.005 # allowed height difference between pier top and bank top
 TRANSFER_MARGIN = 0.05   # clearance of the carried block's bottom above the built structure
 PLACE_DROP = 0.002       # how far above the target the TCP stops before releasing
 
 # Gripper (the Franka Hand opens at most 0.08 m)
-OPEN_WIDTH = min(BLOCK_W + 0.02, 0.08)
+GRIP_WIDTH = BLOCK_L if GRIP_ACROSS == "length" else BLOCK_W  # the size between the fingers
+MAX_OPEN_WIDTH = 0.08
+OPEN_WIDTH = min(GRIP_WIDTH + 0.02, MAX_OPEN_WIDTH)
 GRIPPER_SPEED = 0.1
 GRASP_FORCE = 20.0
 GRASP_TOLERANCE = 0.005
@@ -121,16 +142,66 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
     if abs(bank_a[2] - bank_b[2]) > HEIGHT_TOLERANCE:
         warnings.append(f"The banks differ in height by {abs(bank_a[2] - bank_b[2]) * 100:.1f} cm; the deck will tilt")
 
-    # Deck blocks are laid end to end:
-    # (n_piers + 1)·L + n_piers·gap = span + 2·bank_bearing
-    n_decks = math.ceil((span + 2 * MIN_BANK_BEARING + DECK_GAP) / (BLOCK_L + DECK_GAP))
-    n_decks = max(n_decks, 1)
-    n_piers = n_decks - 1
-    bank_bearing = (n_decks * BLOCK_L + n_piers * DECK_GAP - span) / 2
-    report.append(f"Span {span * 100:.1f} cm -> {n_decks} deck block(s), {n_piers} pier(s)")
-    report.append(f"Deck rests {bank_bearing * 100:.1f} cm on each bank")
-    if bank_bearing > BLOCK_L / 2:
-        warnings.append("The deck rests more than half a block on the banks: the span is short; use fewer piers or move the banks closer")
+    # Two parallel blocks per layer, offset ±offset from the pier centre. Gripped
+    # across their width, a finger goes between them, so they sit flush with the
+    # pier's L×L square and the gap is L − 2W. Gripped across their length, they
+    # can sit LAYER_GAP apart.
+    min_gap = FINGER_CLEARANCE if GRIP_ACROSS == "width" else LAYER_GAP
+    offset = max(BLOCK_L / 2 - BLOCK_W / 2, BLOCK_W / 2 + min_gap / 2)
+    gap = 2 * offset - BLOCK_W
+    pier_half = max(BLOCK_L / 2, offset + BLOCK_W / 2)  # half the pier's footprint
+    report.append(
+        f"Gripped across the {GRIP_ACROSS} ({GRIP_WIDTH * 100:.1f} cm, opening "
+        f"{OPEN_WIDTH * 100:.1f} cm); layer gap {gap * 100:.1f} cm; "
+        f"pier footprint {pier_half * 200:.1f} cm square"
+    )
+    if GRIP_WIDTH + 0.02 > MAX_OPEN_WIDTH:
+        warnings.append(
+            f"The gripper must open to {(GRIP_WIDTH + 0.02) * 100:.1f} cm but opens to at most "
+            f"{MAX_OPEN_WIDTH * 100:.0f} cm: grip across the other side"
+        )
+    if gap < min_gap - 1e-9:
+        warnings.append(f"Layer gap {gap * 100:.1f} cm is less than the {min_gap * 100:.1f} cm needed")
+    if offset > BLOCK_L / 2:
+        warnings.append(
+            "The blocks of a layer are farther apart than a block is long: "
+            "the layer above does not reach their centres"
+        )
+
+    if BUILD_DECK:
+        # Deck blocks are laid end to end:
+        # (n_piers + 1)·L + n_piers·gap = span + 2·bank_bearing
+        n_decks = math.ceil((span + 2 * MIN_BANK_BEARING + DECK_GAP) / (BLOCK_L + DECK_GAP))
+        n_decks = max(n_decks, 1)
+        n_piers = n_decks - 1
+        bank_bearing = (n_decks * BLOCK_L + n_piers * DECK_GAP - span) / 2
+        start = bank_a - u * bank_bearing  # where the first deck block starts (on bank A)
+        start[2] = bank_z
+        pier_centers = [
+            start + u * ((k + 1) * BLOCK_L + (k + 0.5) * DECK_GAP) for k in range(n_piers)
+        ]
+        report.append(f"Span {span * 100:.1f} cm -> {n_decks} deck block(s), {n_piers} pier(s)")
+        report.append(f"Deck rests {bank_bearing * 100:.1f} cm on each bank")
+        if bank_bearing > BLOCK_L / 2:
+            warnings.append("The deck rests more than half a block on the banks: the span is short; use fewer piers or move the banks closer")
+    else:
+        # No deck: one pier midway between the banks.
+        middle = (bank_a + bank_b) / 2
+        middle[2] = bank_z
+        pier_centers = [middle]
+        report.append(f"Span {span * 100:.1f} cm, no deck -> 1 pier midway between the banks")
+
+    if pier_centers:
+        # Gap between a bank's inner edge and the nearest pier's outer face.
+        # One of the layers is gripped on the faces that point at the banks,
+        # so a finger goes in there.
+        bank_gap = abs(float(np.dot(pier_centers[0] - bank_a, u))) - pier_half
+        report.append(f"Gap between each bank and the pier: {bank_gap * 100:.1f} cm")
+        if bank_gap < FINGER_CLEARANCE - 1e-9:
+            warnings.append(
+                f"Bank-to-pier gap {bank_gap * 100:.1f} cm is less than the "
+                f"{FINGER_CLEARANCE * 100:.1f} cm the fingers need: move the banks apart"
+            )
 
     # Make the pier top as level with the banks as possible
     pier_base = TABLE_Z
@@ -145,18 +216,8 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
             f"{pier_top * 100:.1f} cm high, or add shims"
         )
 
-    # Two parallel blocks per layer, outer faces flush with the pier's L×L square footprint
-    offset = BLOCK_L / 2 - BLOCK_W / 2
-    gap = 2 * offset - BLOCK_W
-    report.append(f"Gap between the two blocks of a layer: {gap * 100:.1f} cm")
-    if gap < FINGER_CLEARANCE:
-        warnings.append(f"Layer gap {gap * 100:.1f} cm is less than the {FINGER_CLEARANCE * 100:.1f} cm the fingers need")
-
     placements: list[Placement] = []
-    start = bank_a - u * bank_bearing  # where the first deck block starts (on bank A)
-    start[2] = bank_z
-    for k in range(n_piers):
-        pier_center = start + u * ((k + 1) * BLOCK_L + (k + 0.5) * DECK_GAP)
+    for k, pier_center in enumerate(pier_centers):
         for layer in range(n_layers):
             # The top layer runs across the bridge axis, so each deck end rests on its own cross block
             across = (n_layers - 1 - layer) % 2 == 0
@@ -169,14 +230,22 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
                 yaw = wrap_yaw(math.atan2(dirn[1], dirn[0]))
                 placements.append(Placement(f"pier{k + 1}-L{layer + 1}{tag}", c, yaw))
 
-    deck_z = pier_top + BLOCK_H / 2
-    for i in range(n_decks):
-        c = start + u * (i * (BLOCK_L + DECK_GAP) + BLOCK_L / 2)
-        c[2] = deck_z
-        placements.append(Placement(f"deck{i + 1}", c, wrap_yaw(axis_yaw)))
+    # The deck blocks go on last. With BUILD_DECK = False only the piers are built;
+    # the banks still set where the piers go and how many layers they have.
+    if BUILD_DECK:
+        deck_z = pier_top + BLOCK_H / 2
+        for i in range(n_decks):
+            c = start + u * (i * (BLOCK_L + DECK_GAP) + BLOCK_L / 2)
+            c[2] = deck_z
+            placements.append(Placement(f"deck{i + 1}", c, wrap_yaw(axis_yaw)))
+    else:
+        report.append("BUILD_DECK = False: no deck blocks")
 
-    if len(placements) > len(SUPPLY):
-        warnings.append(f"{len(placements)} blocks are needed but only {len(SUPPLY)} supply positions are defined")
+    n_supply = sum(stack[3] for stack in SUPPLY_STACKS)
+    if len(placements) > n_supply:
+        warnings.append(f"{len(placements)} blocks are needed but the supply stacks hold only {n_supply}")
+    if GRASP_DEPTH > BLOCK_H:
+        warnings.append("GRASP_DEPTH is more than a block high: the fingers would reach the block below")
 
     return placements, report, warnings, max(bank_z, pier_top)
 
@@ -184,6 +253,16 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
 # ---------------------------------------------------------------------------
 # Motion planning
 # ---------------------------------------------------------------------------
+
+def grip_yaw(block_yaw: float) -> float:
+    """Gripper yaw for a block with this yaw. tcp_pose closes the fingers
+    perpendicular to its yaw, i.e. across BLOCK_W when it equals the block's
+    yaw; to close them along the block's length the gripper turns 90°."""
+
+    if GRIP_ACROSS == "length":
+        return wrap_yaw(block_yaw + math.pi / 2)
+    return wrap_yaw(block_yaw)
+
 
 def tcp_pose(position: np.ndarray, yaw: float) -> SE3:
     """Gripper pointing straight down; the fingers close perpendicular to yaw,
@@ -282,15 +361,46 @@ class Step:
         return 1.0  # rough estimate for a gripper action; MEASURE
 
 
+def supply_picks():
+    """Where each supply block is, in the order they are picked.
+
+    Returns a list of (x, y, yaw, top_z): top_z is the height of that block's
+    top face. Each stack is emptied from the top down before the next one, so
+    every pick is a little lower than the one before it on the same stack.
+    """
+
+    picks = []
+    for sx, sy, syaw, count in SUPPLY_STACKS:
+        for remaining in range(count, 0, -1):
+            picks.append((sx, sy, syaw, TABLE_Z + remaining * BLOCK_H))
+    return picks
+
+
+def supply_top():
+    """Height of the tallest supply stack, before any block is taken."""
+
+    return TABLE_Z + max((stack[3] for stack in SUPPLY_STACKS), default=0) * BLOCK_H
+
+
+def safe_height(structure_top):
+    """TCP height for transfers: the carried block's bottom clears both the
+    bridge and the supply stacks by TRANSFER_MARGIN."""
+
+    tallest = max(structure_top, supply_top())
+    # The TCP sits GRASP_DEPTH below the carried block's top, so the block's
+    # bottom is BLOCK_H - GRASP_DEPTH below the TCP.
+    return tallest + (BLOCK_H - GRASP_DEPTH) + TRANSFER_MARGIN
+
+
 def plan_build(panda, placements, structure_top, q_start):
     gen = RuckigMotionGenerator()
-    safe_z = structure_top + BLOCK_H + TRANSFER_MARGIN  # the TCP is at the block's mid-height
+    safe_z = safe_height(structure_top)
     steps: list[Step] = [Step("open gripper", "open", width=OPEN_WIDTH)]
     q = np.asarray(q_start, dtype=float)
 
-    for placement, (sx, sy, syaw) in zip(placements, SUPPLY):
-        pick_z = TABLE_Z + BLOCK_H / 2
-        pick_yaw = wrap_yaw(syaw)
+    for placement, (sx, sy, syaw, top_z) in zip(placements, supply_picks()):
+        pick_z = top_z - GRASP_DEPTH
+        pick_yaw = grip_yaw(syaw)
         name = placement.name
 
         q_above = solve_ik(panda, tcp_pose(np.array([sx, sy, safe_z]), pick_yaw), q)
@@ -301,7 +411,7 @@ def plan_build(panda, placements, structure_top, q_start):
         traj, dt = vertical_trajectory(panda, gen, q, pick_z)
         steps.append(Step(f"{name}: descend to pick", "move", traj, dt))
         q = traj[-1]
-        steps.append(Step(f"{name}: grasp", "grasp", width=BLOCK_W))
+        steps.append(Step(f"{name}: grasp", "grasp", width=GRIP_WIDTH))
 
         traj, dt = vertical_trajectory(panda, gen, q, safe_z)
         steps.append(Step(f"{name}: lift", "move", traj, dt))
@@ -309,12 +419,15 @@ def plan_build(panda, placements, structure_top, q_start):
 
         above = placement.center.copy()
         above[2] = safe_z
-        q_above = solve_ik(panda, tcp_pose(above, placement.yaw), q)
+        q_above = solve_ik(panda, tcp_pose(above, grip_yaw(placement.yaw)), q)
         traj, dt = joint_trajectory(q, q_above)
         steps.append(Step(f"{name}: transfer above place pose", "move", traj, dt))
         q = traj[-1]
 
-        traj, dt = vertical_trajectory(panda, gen, q, placement.center[2] + PLACE_DROP)
+        # The TCP holds the block GRASP_DEPTH below its top face, so for the
+        # block's centre to land on placement.center the TCP stops this high.
+        place_z = placement.center[2] + BLOCK_H / 2 - GRASP_DEPTH
+        traj, dt = vertical_trajectory(panda, gen, q, place_z + PLACE_DROP)
         steps.append(Step(f"{name}: descend to place", "move", traj, dt))
         q = traj[-1]
         steps.append(Step(f"{name}: release", "open", width=OPEN_WIDTH))
@@ -361,7 +474,7 @@ def run_steps(steps, visualizer=None, real_robot=None):
             real_robot.gripper.move(st.width, GRIPPER_SPEED)
         else:
             ok = real_robot.gripper.grasp(
-                width=BLOCK_W,
+                width=GRIP_WIDTH,
                 speed=GRIPPER_SPEED,
                 force=GRASP_FORCE,
                 epsilon_inner=GRASP_TOLERANCE,
@@ -408,7 +521,7 @@ def main() -> None:
     print("\n== Motion plan ==")
     steps = plan_build(panda, placements, top, q_start)
     total = sum(st.duration for st in steps)
-    n_blocks = min(len(placements), len(SUPPLY))
+    n_blocks = min(len(placements), len(supply_picks()))
     print(f"  {n_blocks} blocks, {len(steps)} steps, about {total:.0f} s (limit {TIME_LIMIT:.0f} s)")
     for problem in check_steps(steps):
         print("  [problem]", problem)
