@@ -43,6 +43,8 @@ BLOCK_L, BLOCK_W, BLOCK_H = 0.075, 0.025, 0.015
 # "length": the two short end faces, holding the block across BLOCK_L. The two
 #           blocks of a layer can then sit almost touching (LAYER_GAP apart).
 #           Needs BLOCK_L + 2 cm <= 8 cm, what the Franka Hand opens to.
+# With 7.5 cm blocks only "width" fits in the hand (7.5 + 2 > 8). The layer gap is
+# then L − 2W = 2.5 cm, so both layers cover the same 7.5 cm square.
 GRIP_ACROSS = "width"
 
 # Inner-edge midpoints of the two banks, Panda base frame [x, y, z],
@@ -51,10 +53,10 @@ GRIP_ACROSS = "width"
 # The bridge runs along y. The pier gets round(bank height / BLOCK_H) layers of
 # 2 blocks: z = 0.03 with 1.5 cm blocks gives 2 layers, 4 blocks.
 # Without a deck the single pier sits midway between the banks, so the span must
-# leave FINGER_CLEARANCE between the pier and each bank: the pier is 5.4 cm wide
-# (two 2.5 cm blocks + LAYER_GAP), so the span must be at least 5.4 + 2·2 = 9.4 cm.
-DEFAULT_BANK_A = np.array([0.45, -0.047, 0.03])
-DEFAULT_BANK_B = np.array([0.45, 0.047, 0.03])
+# leave FINGER_CLEARANCE between the pier and each bank: the pier is 7.5 cm wide
+# (one block length), so the span must be at least 7.5 + 2·2 = 11.5 cm.
+DEFAULT_BANK_A = np.array([0.45, -0.06, 0.03])
+DEFAULT_BANK_B = np.array([0.45, 0.06, 0.03])
 
 # False: build only the piers, no deck blocks on top.
 BUILD_DECK = False
@@ -67,7 +69,7 @@ TABLE_Z = 0.0
 # Blocks are taken from the top of the first stack until it is empty, then from
 # the next stack. TO DECIDE: must be reachable and out of the way of the bridge.
 SUPPLY_STACKS = [
-    (0.42, 0.36, math.pi / 2, 4),
+    (0.0125, 0.55, math.pi / 2, 4),
 ]
 
 # How far below a block's top face the TCP (fingertip centre) goes to grasp it.
@@ -88,6 +90,11 @@ PLACE_DROP = 0.002       # how far above the target the TCP stops before releasi
 GRIP_WIDTH = BLOCK_L if GRIP_ACROSS == "length" else BLOCK_W  # the size between the fingers
 MAX_OPEN_WIDTH = 0.08
 OPEN_WIDTH = min(GRIP_WIDTH + 0.02, MAX_OPEN_WIDTH)
+# Opening when releasing a placed block. Kept small so the fingers do not hit the
+# neighbouring blocks: each finger moves out (RELEASE_WIDTH - GRIP_WIDTH) / 2.
+# The gripper reopens to OPEN_WIDTH only after retreating to the safe height.
+# MEASURE: it must still let go of the block reliably.
+RELEASE_WIDTH = min(GRIP_WIDTH + 0.006, OPEN_WIDTH)
 GRIPPER_SPEED = 0.1
 GRASP_FORCE = 20.0
 GRASP_TOLERANCE = 0.005
@@ -101,7 +108,7 @@ TIME_LIMIT = 300.0
 
 # True: only plan and print; no Swift, no real robot.
 DRY_RUN = False
-RUN_ON_REAL = False
+RUN_ON_REAL = True
 
 # Panda joint limits (the datasheet values the miniPC checks against)
 JOINT_VEL_LIM = np.array([2.175] * 4 + [2.61] * 3)
@@ -152,7 +159,7 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
     pier_half = max(BLOCK_L / 2, offset + BLOCK_W / 2)  # half the pier's footprint
     report.append(
         f"Gripped across the {GRIP_ACROSS} ({GRIP_WIDTH * 100:.1f} cm, opening "
-        f"{OPEN_WIDTH * 100:.1f} cm); layer gap {gap * 100:.1f} cm; "
+        f"{OPEN_WIDTH * 100:.1f} cm, release {RELEASE_WIDTH * 100:.1f} cm); layer gap {gap * 100:.1f} cm; "
         f"pier footprint {pier_half * 200:.1f} cm square"
     )
     if GRIP_WIDTH + 0.02 > MAX_OPEN_WIDTH:
@@ -398,7 +405,8 @@ def plan_build(panda, placements, structure_top, q_start):
     steps: list[Step] = [Step("open gripper", "open", width=OPEN_WIDTH)]
     q = np.asarray(q_start, dtype=float)
 
-    for placement, (sx, sy, syaw, top_z) in zip(placements, supply_picks()):
+    jobs = list(zip(placements, supply_picks()))
+    for k, (placement, (sx, sy, syaw, top_z)) in enumerate(jobs):
         pick_z = top_z - GRASP_DEPTH
         pick_yaw = grip_yaw(syaw)
         name = placement.name
@@ -430,11 +438,16 @@ def plan_build(panda, placements, structure_top, q_start):
         traj, dt = vertical_trajectory(panda, gen, q, place_z + PLACE_DROP)
         steps.append(Step(f"{name}: descend to place", "move", traj, dt))
         q = traj[-1]
-        steps.append(Step(f"{name}: release", "open", width=OPEN_WIDTH))
+        # Open only a little, so the fingers do not hit the neighbouring blocks.
+        steps.append(Step(f"{name}: release", "open", width=RELEASE_WIDTH))
 
         traj, dt = vertical_trajectory(panda, gen, q, safe_z)
         steps.append(Step(f"{name}: retreat", "move", traj, dt))
         q = traj[-1]
+
+        if RELEASE_WIDTH < OPEN_WIDTH and k < len(jobs) - 1:
+            # Clear of everything now: open fully for the next pick.
+            steps.append(Step(f"{name}: open for the next block", "open", width=OPEN_WIDTH))
 
     return steps
 
@@ -460,7 +473,83 @@ def check_steps(steps):
 # Execution
 # ---------------------------------------------------------------------------
 
-def run_steps(steps, visualizer=None, real_robot=None):
+class BuildScene:
+    """Draws the banks, the supply stacks and the blocks in Swift, and moves the
+    blocks with the gripper during the preview. Preview only: none of this is
+    sent to the real robot."""
+
+    BANK_COLOR = (0.55, 0.45, 0.35)
+    SUPPLY_COLOR = (0.6, 0.6, 0.6)
+    CARRIED_COLOR = (0.9, 0.6, 0.2)
+    PLACED_COLOR = (0.2, 0.6, 0.9)
+    BANK_LENGTH = 0.10  # how far each drawn bank reaches out from its inner edge
+    BANK_WIDTH = 0.15   # drawn bank size across the bridge
+
+    def __init__(self, panda, visualizer, bank_a, bank_b, placements):
+        import spatialgeometry as sg
+
+        self._sg = sg
+        self.panda = panda
+        self.visualizer = visualizer
+        self.placements = placements
+        self.blocks = []     # one per supply pick, in pick order
+        self.n_grasped = 0
+        self.carried = None  # (block, offset from the TCP) while held
+        try:
+            self._add_banks(bank_a, bank_b)
+            for sx, sy, syaw, top_z in supply_picks():
+                pose = SE3.Trans(sx, sy, top_z - BLOCK_H / 2) * SE3.Rz(wrap_yaw(syaw))
+                self.blocks.append(self._box([BLOCK_L, BLOCK_W, BLOCK_H], pose, self.SUPPLY_COLOR))
+            visualizer.set_trajectory_callback(self._follow)
+            self.ok = True
+        except Exception as error:
+            print(f"Could not draw the blocks in Swift ({error}); previewing the robot only.")
+            self.ok = False
+
+    def _box(self, scale, pose, color):
+        box = self._sg.Cuboid(scale=scale, pose=pose, color=color)
+        self.visualizer.env.add(box)
+        return box
+
+    def _add_banks(self, bank_a, bank_b):
+        u = bank_b[:2] - bank_a[:2]
+        u = u / np.linalg.norm(u)  # from bank A towards bank B
+        yaw = math.atan2(u[1], u[0])
+        for edge, outward in ((bank_a, -u), (bank_b, u)):
+            height = edge[2] - TABLE_Z
+            if height <= 0:
+                continue
+            centre_xy = edge[:2] + outward * self.BANK_LENGTH / 2
+            pose = SE3.Trans(centre_xy[0], centre_xy[1], TABLE_Z + height / 2) * SE3.Rz(yaw)
+            self._box([self.BANK_LENGTH, self.BANK_WIDTH, height], pose, self.BANK_COLOR)
+
+    def _tcp(self):
+        return self.panda.fkine(self.visualizer.q)
+
+    def _follow(self, _index):
+        if self.carried is not None:
+            block, offset = self.carried
+            block.T = (self._tcp() * offset).A
+
+    def after_step(self, st):
+        """Update the blocks after a gripper step of the preview."""
+
+        if not self.ok:
+            return
+        if st.kind == "grasp" and self.n_grasped < len(self.blocks):
+            block = self.blocks[self.n_grasped]
+            self.n_grasped += 1
+            block.color = self.CARRIED_COLOR
+            self.carried = (block, self._tcp().inv() * SE3(block.T))
+        elif st.kind == "open" and self.carried is not None:
+            # Released PLACE_DROP above the target: let it drop straight down.
+            block, _ = self.carried
+            block.T = (SE3.Trans(0, 0, -PLACE_DROP) * SE3(block.T)).A
+            block.color = self.PLACED_COLOR
+            self.carried = None
+
+
+def run_steps(steps, visualizer=None, real_robot=None, scene=None):
     for st in steps:
         print(("[real] " if real_robot else "[preview] ") + st.label)
         if st.kind == "move":
@@ -470,6 +559,8 @@ def run_steps(steps, visualizer=None, real_robot=None):
                 visualizer.run_joint_trajectory(st.q_traj, st.dt)
         elif real_robot is None:
             visualizer.move_gripper(st.width, GRIPPER_SPEED)
+            if scene is not None:
+                scene.after_step(st)
         elif st.kind == "open":
             real_robot.gripper.move(st.width, GRIPPER_SPEED)
         else:
@@ -535,9 +626,11 @@ def main() -> None:
 
     visualizer = RtbVisualizer(panda, q_start, real_robot=real_robot)
     try:
+        scene = BuildScene(panda, visualizer, bank_a, bank_b, placements)
         input("Press Enter to preview the whole build in Swift.")
-        run_steps(steps, visualizer=visualizer)
+        run_steps(steps, visualizer=visualizer, scene=scene)
         if real_robot is None:
+            input("Preview done. Press Enter to close Swift.")
             return
         if input("Preview done. When it is safe, type yes to run it on the real robot: ").strip().lower() != "yes":
             print("You did not type yes; the real robot will not move.")
