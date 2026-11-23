@@ -34,7 +34,7 @@ from csc376_franky.motion_generator import RuckigMotionGenerator
 # ---------------------------------------------------------------------------
 
 # Block size [length, width, height] in metres. MEASURE.
-BLOCK_L, BLOCK_W, BLOCK_H = 0.05, 0.025, 0.015
+BLOCK_L, BLOCK_W, BLOCK_H = 0.075, 0.025, 0.015
 
 # Which pair of faces the fingers close on:
 # "width":  the two long faces, holding the block across BLOCK_W. A finger then
@@ -43,7 +43,7 @@ BLOCK_L, BLOCK_W, BLOCK_H = 0.05, 0.025, 0.015
 # "length": the two short end faces, holding the block across BLOCK_L. The two
 #           blocks of a layer can then sit almost touching (LAYER_GAP apart).
 #           Needs BLOCK_L + 2 cm <= 8 cm, what the Franka Hand opens to.
-GRIP_ACROSS = "length"
+GRIP_ACROSS = "width"
 
 # Inner-edge midpoints of the two banks, Panda base frame [x, y, z],
 # z = bank top height. MEASURE.
