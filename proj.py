@@ -55,8 +55,8 @@ GRIP_ACROSS = "width"
 # Without a deck the single pier sits midway between the banks, so the span must
 # leave FINGER_CLEARANCE between the pier and each bank: the pier is 7.5 cm wide
 # (one block length), so the span must be at least 7.5 + 2·2 = 11.5 cm.
-DEFAULT_BANK_A = np.array([0.45, -0.06, 0.03])
-DEFAULT_BANK_B = np.array([0.45, 0.06, 0.03])
+DEFAULT_BANK_A = np.array([0.4681, -0.1399, 0.10])
+DEFAULT_BANK_B = np.array([0.4656, -0.5945, 0.10])
 
 # False: build only the piers, no deck blocks on top.
 BUILD_DECK = False
@@ -69,7 +69,9 @@ TABLE_Z = 0.0
 # Blocks are taken from the top of the first stack until it is empty, then from
 # the next stack. TO DECIDE: must be reachable and out of the way of the bridge.
 SUPPLY_STACKS = [
-    (0.0125, 0.55, math.pi / 2, 4),
+    (-0.1427, 0.5232, math.pi / 2, 6),
+    (-0.0208, 0.5232, math.pi / 2, 6),
+    (0.1104, 0.5230, math.pi / 2, 6),
 ]
 
 # How far below a block's top face the TCP (fingertip centre) goes to grasp it.
