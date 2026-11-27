@@ -18,7 +18,9 @@ Workflow
 4. Print the layout, the checks and the total duration (the project requires
    finishing within 5 minutes).
 5. With DRY_RUN=False: preview the whole build in Swift first, then type yes
-   once and the real robot executes it.
+   once and the real robot executes it. Type s instead of Enter to skip the
+   preview, or press Ctrl+C during it to skip the rest: either way Swift jumps
+   to the finished bridge.
 
 Every parameter marked "MEASURE" must be measured at the station and updated.
 """
@@ -610,6 +612,33 @@ def run_steps(steps, visualizer=None, real_robot=None, scene=None):
                 raise RuntimeError(f"{st.label}: the gripper did not grasp the block; stopping the build")
 
 
+def skip_preview(steps, visualizer, scene):
+    """Shows the end of these steps in Swift at once, without animating them:
+    the robot jumps to the end of each move and the blocks are placed as the
+    preview would place them."""
+
+    for st in steps:
+        if st.kind == "move":
+            visualizer.run_joint_trajectory(st.q_traj[-1:], 0.0)
+        else:
+            visualizer.rtb_robot_model.grippers[0].q = [st.width / 2] * 2
+            scene.after_step(st)
+
+
+def run_preview(steps, visualizer, scene):
+    """Animates the build in Swift. Ctrl+C skips the rest of it: the preview
+    jumps to the finished bridge."""
+
+    done = 0
+    try:
+        for st in steps:
+            run_steps([st], visualizer=visualizer, scene=scene)
+            done += 1
+    except KeyboardInterrupt:
+        print("\nPreview skipped; showing the finished bridge.")
+        skip_preview(steps[done:], visualizer, scene)
+
+
 def read_point(prompt: str, default: np.ndarray) -> np.ndarray:
     text = input(f"{prompt} x y z (metres, Enter for default {default.tolist()}): ").strip()
     if not text:
@@ -662,8 +691,13 @@ def main() -> None:
     visualizer = RtbVisualizer(panda, q_start, real_robot=real_robot)
     try:
         scene = BuildScene(panda, visualizer, end_a, end_b, placements)
-        input("Press Enter to preview the whole build in Swift.")
-        run_steps(steps, visualizer=visualizer, scene=scene)
+        answer = input("Press Enter to preview the whole build in Swift (Ctrl+C during it skips the rest), "
+                       "or type s to skip it: ").strip().lower()
+        if answer == "s":
+            print("Preview skipped; showing the finished bridge.")
+            skip_preview(steps, visualizer, scene)
+        else:
+            run_preview(steps, visualizer, scene)
         if real_robot is None:
             input("Preview done. Press Enter to close Swift.")
             return
