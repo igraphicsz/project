@@ -1,13 +1,18 @@
-"""CSC376 project: a Panda builds a block bridge between two riverbanks.
+"""CSC376 project: a Panda builds a block bridge between two points.
 
 Workflow
-1. Enter the coordinates of the two banks' inner-edge midpoints (Panda base
-   frame; z is the bank top height).
+1. Enter the coordinates of the bridge's two end points (Panda base frame;
+   z is the height the pier tops should reach). There are no riverbanks: a pier
+   stands on each end point, plus equally spaced piers in between.
 2. From the preset block size, compute automatically:
-   - how many equally spaced piers are needed (spacing = one deck block length);
-   - how many layers each pier has (so the pier top is as level with the banks
-     as possible), with two parallel blocks per layer, each layer rotated 90°;
-   - the placement pose and build order of every block.
+   - how many piers are needed and their spacing (wide enough for a finger to
+     go between neighbouring piers, narrow enough for a deck block to rest on both);
+   - how many layers each pier has, with two parallel blocks per layer, each
+     layer rotated 90°;
+   - the placement pose and build order of every block: all piers rise together,
+     one layer at a time (layer 1 of every pier, then layer 2, ...), and the deck
+     goes on last. A neighbouring pier is then never taller than the layer being
+     placed, so the fingers never have to reach down beside a finished pier.
 3. For each block plan: a joint-space transfer at a safe height, Cartesian
    vertical descent/lift, and the gripper actions.
 4. Print the layout, the checks and the total duration (the project requires
@@ -47,16 +52,12 @@ BLOCK_L, BLOCK_W, BLOCK_H = 0.075, 0.025, 0.015
 # then L − 2W = 2.5 cm, so both layers cover the same 7.5 cm square.
 GRIP_ACROSS = "width"
 
-# Inner-edge midpoints of the two banks, Panda base frame [x, y, z],
-# z = bank top height. MEASURE.
-# How: jog the fingertips to the bank edge and read robot.get_current_pose().t.
-# The bridge runs along y. The pier gets round(bank height / BLOCK_H) layers of
-# 2 blocks: z = 0.03 with 1.5 cm blocks gives 2 layers, 4 blocks.
-# Without a deck the single pier sits midway between the banks, so the span must
-# leave FINGER_CLEARANCE between the pier and each bank: the pier is 7.5 cm wide
-# (one block length), so the span must be at least 7.5 + 2·2 = 11.5 cm.
-DEFAULT_BANK_A = np.array([0.4681, -0.1399, 0.10])
-DEFAULT_BANK_B = np.array([0.4656, -0.5945, 0.10])
+# The bridge's two end points, Panda base frame [x, y, z]. A pier is built
+# centred on each, and z is the height its top should reach (the table counts as
+# z = TABLE_Z). Each pier gets round((z - TABLE_Z) / BLOCK_H) layers of 2 blocks:
+# z = 0.03 with 1.5 cm blocks gives 2 layers, 4 blocks per pier.
+DEFAULT_END_A = np.array([0.4681, -0.1399, 0.03])
+DEFAULT_END_B = np.array([0.4656, -0.5945, 0.03])
 
 # False: build only the piers, no deck blocks on top.
 BUILD_DECK = False
@@ -80,11 +81,10 @@ SUPPLY_STACKS = [
 # MEASURE with the real fingers: with thin blocks the pads may reach the block below.
 GRASP_DEPTH = BLOCK_H / 2
 
-MIN_BANK_BEARING = 0.02  # minimum length of deck resting on each bank
-DECK_GAP = 0.004         # gap between adjacent deck ends, so placing the second one does not hit the first
-FINGER_CLEARANCE = 0.02  # minimum gap wherever a finger has to go between two things
+MIN_DECK_BEARING = 0.02  # minimum length of a deck block resting on each pier it spans
+FINGER_CLEARANCE = 0.02  # minimum gap wherever a finger has to go between two things (also between piers)
 LAYER_GAP = 0.004        # minimum gap between the two blocks of a layer when no finger goes in it
-HEIGHT_TOLERANCE = 0.005 # allowed height difference between pier top and bank top
+HEIGHT_TOLERANCE = 0.005 # allowed difference between the pier top and the requested z
 TRANSFER_MARGIN = 0.05   # clearance of the carried block's bottom above the built structure
 PLACE_DROP = 0.002       # how far above the target the TCP stops before releasing
 
@@ -137,19 +137,62 @@ def wrap_yaw(yaw: float) -> float:
     return math.pi / 2 if math.isclose(yaw, -math.pi / 2) else yaw
 
 
-def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
+def pier_spacing(span: float, pier_half: float):
+    """Number of intervals between the two end piers, and the warnings about it.
+
+    Neighbouring piers must leave FINGER_CLEARANCE between them (a finger goes
+    there when a cross layer is placed). With a deck, each deck block is centred
+    over one gap and must rest MIN_DECK_BEARING on both piers, which caps the
+    spacing; without a deck, use as few piers as the clearance allows.
+    """
+
+    min_d = 2 * pier_half + FINGER_CLEARANCE
+    # A deck block centred between two piers rests (L - gap) / 2 on each.
+    max_d = 2 * pier_half + BLOCK_L - 2 * MIN_DECK_BEARING
+    warnings = []
+    if span < min_d - 1e-9:
+        warnings.append(
+            f"The end points are only {span * 100:.1f} cm apart: two piers need at least "
+            f"{min_d * 100:.1f} cm between centres; move the points apart"
+        )
+        return 1, warnings
+    fewest = max(1, math.floor(span / min_d + 1e-9))
+    if not BUILD_DECK:
+        return fewest, warnings
+    if max_d < min_d:
+        warnings.append("A deck block is too short to span a gap the fingers fit into")
+        return fewest, warnings
+    n = math.ceil(span / max_d - 1e-9)
+    if span / n < min_d - 1e-9:
+        # No whole number of intervals fits this span: say which spans do, and
+        # keep the finger clearance (the deck then rests a little less on each pier).
+        warnings.append(
+            f"No equal pier spacing between {min_d * 100:.1f} and {max_d * 100:.1f} cm fits a "
+            f"{span * 100:.1f} cm span: make it at most {(n - 1) * max_d * 100:.1f} cm "
+            f"or at least {n * min_d * 100:.1f} cm"
+        )
+        return fewest, warnings
+    return n, warnings
+
+
+def plan_layout(end_a: np.ndarray, end_b: np.ndarray):
     """Return (Placements in build order, report lines, warnings, structure top height)."""
 
     report, warnings = [], []
-    axis = bank_b[:2] - bank_a[:2]
+    axis = end_b[:2] - end_a[:2]
     span = float(np.linalg.norm(axis))
+    if span < 1e-6:
+        raise ValueError("The two end points are the same point")
     u = np.append(axis / span, 0.0)          # along the bridge
     v = np.array([-u[1], u[0], 0.0])         # across the bridge
     axis_yaw = math.atan2(u[1], u[0])
-    bank_z = (bank_a[2] + bank_b[2]) / 2
+    target_z = (end_a[2] + end_b[2]) / 2
 
-    if abs(bank_a[2] - bank_b[2]) > HEIGHT_TOLERANCE:
-        warnings.append(f"The banks differ in height by {abs(bank_a[2] - bank_b[2]) * 100:.1f} cm; the deck will tilt")
+    if abs(end_a[2] - end_b[2]) > HEIGHT_TOLERANCE:
+        warnings.append(
+            f"The end points differ in height by {abs(end_a[2] - end_b[2]) * 100:.1f} cm; "
+            f"all piers are built to the average, {target_z * 100:.1f} cm"
+        )
 
     # Two parallel blocks per layer, offset ±offset from the pier centre. Gripped
     # across their width, a finger goes between them, so they sit flush with the
@@ -177,86 +220,76 @@ def plan_layout(bank_a: np.ndarray, bank_b: np.ndarray):
             "the layer above does not reach their centres"
         )
 
-    if BUILD_DECK:
-        # Deck blocks are laid end to end:
-        # (n_piers + 1)·L + n_piers·gap = span + 2·bank_bearing
-        n_decks = math.ceil((span + 2 * MIN_BANK_BEARING + DECK_GAP) / (BLOCK_L + DECK_GAP))
-        n_decks = max(n_decks, 1)
-        n_piers = n_decks - 1
-        bank_bearing = (n_decks * BLOCK_L + n_piers * DECK_GAP - span) / 2
-        start = bank_a - u * bank_bearing  # where the first deck block starts (on bank A)
-        start[2] = bank_z
-        pier_centers = [
-            start + u * ((k + 1) * BLOCK_L + (k + 0.5) * DECK_GAP) for k in range(n_piers)
-        ]
-        report.append(f"Span {span * 100:.1f} cm -> {n_decks} deck block(s), {n_piers} pier(s)")
-        report.append(f"Deck rests {bank_bearing * 100:.1f} cm on each bank")
-        if bank_bearing > BLOCK_L / 2:
-            warnings.append("The deck rests more than half a block on the banks: the span is short; use fewer piers or move the banks closer")
-    else:
-        # No deck: one pier midway between the banks.
-        middle = (bank_a + bank_b) / 2
-        middle[2] = bank_z
-        pier_centers = [middle]
-        report.append(f"Span {span * 100:.1f} cm, no deck -> 1 pier midway between the banks")
+    # A pier on each end point, the rest equally spaced in between.
+    n_intervals, spacing_warnings = pier_spacing(span, pier_half)
+    warnings += spacing_warnings
+    spacing = span / n_intervals
+    pier_centers = []
+    for k in range(n_intervals + 1):
+        c = end_a + u * (k * spacing)
+        c[2] = target_z
+        pier_centers.append(c)
+    pier_gap = spacing - 2 * pier_half
+    report.append(
+        f"Span {span * 100:.1f} cm -> {len(pier_centers)} piers, {spacing * 100:.1f} cm apart "
+        f"({pier_gap * 100:.1f} cm between neighbouring piers)"
+    )
 
-    if pier_centers:
-        # Gap between a bank's inner edge and the nearest pier's outer face.
-        # One of the layers is gripped on the faces that point at the banks,
-        # so a finger goes in there.
-        bank_gap = abs(float(np.dot(pier_centers[0] - bank_a, u))) - pier_half
-        report.append(f"Gap between each bank and the pier: {bank_gap * 100:.1f} cm")
-        if bank_gap < FINGER_CLEARANCE - 1e-9:
-            warnings.append(
-                f"Bank-to-pier gap {bank_gap * 100:.1f} cm is less than the "
-                f"{FINGER_CLEARANCE * 100:.1f} cm the fingers need: move the banks apart"
-            )
-
-    # Make the pier top as level with the banks as possible
     pier_base = TABLE_Z
-    n_layers = max(1, round((bank_z - pier_base) / BLOCK_H))
+    n_layers = max(1, round((target_z - pier_base) / BLOCK_H))
     pier_top = pier_base + n_layers * BLOCK_H
     report.append(
-        f"Bank top {bank_z * 100:.1f} cm, pier {n_layers} layer(s), pier top {pier_top * 100:.1f} cm"
+        f"Requested height {target_z * 100:.1f} cm, pier {n_layers} layer(s), pier top {pier_top * 100:.1f} cm"
     )
-    if abs(pier_top - bank_z) > HEIGHT_TOLERANCE:
+    if abs(pier_top - target_z) > HEIGHT_TOLERANCE:
         warnings.append(
-            f"Pier top differs from bank top by {(pier_top - bank_z) * 100:+.1f} cm: make the banks "
-            f"{pier_top * 100:.1f} cm high, or add shims"
+            f"Pier top differs from the requested height by {(pier_top - target_z) * 100:+.1f} cm "
+            f"(z is rounded to whole layers of {BLOCK_H * 100:.1f} cm)"
         )
 
+    # Layer by layer across all piers: layer 1 of every pier, then layer 2, ...
+    # The pier order is reversed on every other layer so the arm does not have
+    # to travel back to the first pier at the start of each layer.
     placements: list[Placement] = []
-    for k, pier_center in enumerate(pier_centers):
-        for layer in range(n_layers):
-            # The top layer runs across the bridge axis, so each deck end rests on its own cross block
-            across = (n_layers - 1 - layer) % 2 == 0
-            dirn = v if across else u     # direction of the blocks' long side
-            side = u if across else v     # direction the two blocks are offset in
-            z = pier_base + (layer + 0.5) * BLOCK_H
+    for layer in range(n_layers):
+        # The top layer runs across the bridge axis, so each deck end rests on its own cross block
+        across = (n_layers - 1 - layer) % 2 == 0
+        dirn = v if across else u     # direction of the blocks' long side
+        side = u if across else v     # direction the two blocks are offset in
+        z = pier_base + (layer + 0.5) * BLOCK_H
+        yaw = wrap_yaw(math.atan2(dirn[1], dirn[0]))
+        order = list(range(len(pier_centers)))
+        if layer % 2 == 1:
+            order.reverse()
+        for k in order:
             for s, tag in ((-1, "a"), (1, "b")):
-                c = pier_center + side * (s * offset)
+                c = pier_centers[k] + side * (s * offset)
                 c[2] = z
-                yaw = wrap_yaw(math.atan2(dirn[1], dirn[0]))
                 placements.append(Placement(f"pier{k + 1}-L{layer + 1}{tag}", c, yaw))
 
-    # The deck blocks go on last. With BUILD_DECK = False only the piers are built;
-    # the banks still set where the piers go and how many layers they have.
+    # The deck goes on last: one block centred over each gap, along the bridge.
+    top = pier_top
     if BUILD_DECK:
+        bearing = (BLOCK_L - pier_gap) / 2
+        report.append(f"{n_intervals} deck block(s), each resting {bearing * 100:.1f} cm on both piers")
+        if bearing < 0.005:
+            warnings.append(f"Deck blocks rest only {bearing * 100:.1f} cm on each pier: they will fall")
+        elif bearing < MIN_DECK_BEARING - 1e-9:
+            warnings.append(f"Deck blocks rest only {bearing * 100:.1f} cm on each pier (less than {MIN_DECK_BEARING * 100:.0f} cm)")
         deck_z = pier_top + BLOCK_H / 2
-        for i in range(n_decks):
-            c = start + u * (i * (BLOCK_L + DECK_GAP) + BLOCK_L / 2)
+        for i in range(n_intervals):
+            c = (pier_centers[i] + pier_centers[i + 1]) / 2
             c[2] = deck_z
             placements.append(Placement(f"deck{i + 1}", c, wrap_yaw(axis_yaw)))
+        top = pier_top + BLOCK_H
     else:
-        report.append("BUILD_DECK = False: no deck blocks")
+        report.append("BUILD_DECK = False: piers only, no deck blocks")
 
-    n_supply = sum(stack[3] for stack in SUPPLY_STACKS)
-    if len(placements) > n_supply:
-        warnings.append(f"{len(placements)} blocks are needed but the supply stacks hold only {n_supply}")
+    report.append(f"{len(placements)} blocks needed")
     if GRASP_DEPTH > BLOCK_H:
         warnings.append("GRASP_DEPTH is more than a block high: the fingers would reach the block below")
 
-    return placements, report, warnings, max(bank_z, pier_top)
+    return placements, report, warnings, top
 
 
 # ---------------------------------------------------------------------------
@@ -476,18 +509,17 @@ def check_steps(steps):
 # ---------------------------------------------------------------------------
 
 class BuildScene:
-    """Draws the banks, the supply stacks and the blocks in Swift, and moves the
+    """Draws the end-point markers, the supply stacks and the blocks in Swift, and moves the
     blocks with the gripper during the preview. Preview only: none of this is
     sent to the real robot."""
 
-    BANK_COLOR = (0.55, 0.45, 0.35)
+    MARKER_COLOR = (0.9, 0.2, 0.2)
     SUPPLY_COLOR = (0.6, 0.6, 0.6)
     CARRIED_COLOR = (0.9, 0.6, 0.2)
     PLACED_COLOR = (0.2, 0.6, 0.9)
-    BANK_LENGTH = 0.10  # how far each drawn bank reaches out from its inner edge
-    BANK_WIDTH = 0.15   # drawn bank size across the bridge
+    MARKER_SIZE = 0.01  # side of the small cube drawn above each end point
 
-    def __init__(self, panda, visualizer, bank_a, bank_b, placements):
+    def __init__(self, panda, visualizer, end_a, end_b, placements):
         import spatialgeometry as sg
 
         self._sg = sg
@@ -498,7 +530,7 @@ class BuildScene:
         self.n_grasped = 0
         self.carried = None  # (block, offset from the TCP) while held
         try:
-            self._add_banks(bank_a, bank_b)
+            self._add_markers(end_a, end_b)
             for sx, sy, syaw, top_z in supply_picks():
                 pose = SE3.Trans(sx, sy, top_z - BLOCK_H / 2) * SE3.Rz(wrap_yaw(syaw))
                 self.blocks.append(self._box([BLOCK_L, BLOCK_W, BLOCK_H], pose, self.SUPPLY_COLOR))
@@ -513,17 +545,12 @@ class BuildScene:
         self.visualizer.env.add(box)
         return box
 
-    def _add_banks(self, bank_a, bank_b):
-        u = bank_b[:2] - bank_a[:2]
-        u = u / np.linalg.norm(u)  # from bank A towards bank B
-        yaw = math.atan2(u[1], u[0])
-        for edge, outward in ((bank_a, -u), (bank_b, u)):
-            height = edge[2] - TABLE_Z
-            if height <= 0:
-                continue
-            centre_xy = edge[:2] + outward * self.BANK_LENGTH / 2
-            pose = SE3.Trans(centre_xy[0], centre_xy[1], TABLE_Z + height / 2) * SE3.Rz(yaw)
-            self._box([self.BANK_LENGTH, self.BANK_WIDTH, height], pose, self.BANK_COLOR)
+    def _add_markers(self, end_a, end_b):
+        """A small cube floating above each end point's requested height."""
+
+        for point in (end_a, end_b):
+            pose = SE3.Trans(point[0], point[1], point[2] + BLOCK_H + self.MARKER_SIZE)
+            self._box([self.MARKER_SIZE] * 3, pose, self.MARKER_COLOR)
 
     def _tcp(self):
         return self.panda.fkine(self.visualizer.q)
@@ -589,10 +616,10 @@ def read_point(prompt: str, default: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     np.set_printoptions(precision=3, suppress=True)
-    bank_a = read_point("Bank A inner-edge midpoint", DEFAULT_BANK_A)
-    bank_b = read_point("Bank B inner-edge midpoint", DEFAULT_BANK_B)
+    end_a = read_point("Bridge end point A", DEFAULT_END_A)
+    end_b = read_point("Bridge end point B", DEFAULT_END_B)
 
-    placements, report, warnings, top = plan_layout(bank_a, bank_b)
+    placements, report, warnings, top = plan_layout(end_a, end_b)
     print("\n== Layout ==")
     for line in report:
         print(" ", line)
@@ -628,7 +655,7 @@ def main() -> None:
 
     visualizer = RtbVisualizer(panda, q_start, real_robot=real_robot)
     try:
-        scene = BuildScene(panda, visualizer, bank_a, bank_b, placements)
+        scene = BuildScene(panda, visualizer, end_a, end_b, placements)
         input("Press Enter to preview the whole build in Swift.")
         run_steps(steps, visualizer=visualizer, scene=scene)
         if real_robot is None:
