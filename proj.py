@@ -285,7 +285,13 @@ def plan_layout(end_a: np.ndarray, end_b: np.ndarray):
     else:
         report.append("BUILD_DECK = False: piers only, no deck blocks")
 
-    report.append(f"{len(placements)} blocks needed")
+    n_supply = sum(stack[3] for stack in SUPPLY_STACKS)
+    report.append(f"{len(placements)} blocks needed, {n_supply} in the supply stacks")
+    if len(placements) > n_supply:
+        warnings.append(
+            f"{len(placements)} blocks are needed but the supply stacks hold only {n_supply}: "
+            f"add {len(placements) - n_supply} more to SUPPLY_STACKS (and to the table)"
+        )
     if GRASP_DEPTH > BLOCK_H:
         warnings.append("GRASP_DEPTH is more than a block high: the fingers would reach the block below")
 
